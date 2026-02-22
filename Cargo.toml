@@ -1,0 +1,8 @@
+[package]
+name = "c11"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gazelle = { version = "1.0.0", package = "gazelle-parser" }
+gazelle-macros = "1.0.0"
