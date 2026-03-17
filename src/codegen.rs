@@ -695,7 +695,20 @@ impl Codegen {
             self.pop_int("%rax"); // result = original new value
             return;
         }
-        if Self::is_float(r.ty.as_ref().unwrap()) {
+        if matches!(lty, CType::Struct(_) | CType::Union(_)) {
+            // Struct/union copy: RHS and LHS both evaluate to addresses
+            let size = self.type_size(lty);
+            self.emit_expr(r);   // source address in %rax
+            self.push_int();
+            self.emit_expr(l);   // dest address in %rax
+            self.emit("movq %rax, %rdi");
+            self.pop_int("%rsi");
+            self.emit(&format!("movl ${}, %ecx", size));
+            self.emit("rep movsb");
+            // Result of assignment is the dest address
+            self.emit("movq %rdi, %rax");
+            self.emit(&format!("subq ${}, %rax", size));
+        } else if Self::is_float(r.ty.as_ref().unwrap()) {
             self.emit_expr(r);
             self.push_float();
             self.emit_expr(l);
@@ -1982,11 +1995,34 @@ impl Codegen {
     fn emit_init_list(&mut self, ty: &CType, items: &[InitItem]) {
         match ty {
             CType::Struct(name) | CType::Union(name) => {
+                let is_union = matches!(ty, CType::Union(_));
                 let fields: Vec<(String, i32, CType, Option<(u8, u8)>)> = self.struct_layouts.get(name)
                     .map(|l| l.fields.clone())
                     .unwrap_or_default();
                 let total_size = self.struct_layouts.get(name).map_or(0, |l| l.size);
 
+                if is_union {
+                    // Union: only emit the first (or designated) member, pad to total_size
+                    if let Some(item) = items.first() {
+                        let field_idx = if let Some(Designator::Field(fname)) = item.designation.first() {
+                            fields.iter().position(|(n, _, _, _)| n == fname).unwrap_or(0)
+                        } else {
+                            0
+                        };
+                        if field_idx < fields.len() {
+                            let (_, _, field_ty, _) = &fields[field_idx];
+                            let field_size = self.type_size(field_ty);
+                            self.emit_init_item(&item.init, field_ty, field_size);
+                            if field_size < total_size {
+                                self.out.push_str(&format!("\t.zero {}\n", total_size - field_size));
+                            }
+                        } else {
+                            self.out.push_str(&format!("\t.zero {}\n", total_size));
+                        }
+                    } else {
+                        self.out.push_str(&format!("\t.zero {}\n", total_size));
+                    }
+                } else {
                 // Check for brace elision: more flat scalar items than fields
                 let has_designators = items.iter().any(|i| !i.designation.is_empty());
                 let has_sublists = items.iter().any(|i| matches!(i.init, Init::List(_)));
@@ -2056,6 +2092,7 @@ impl Codegen {
                     if offset < total_size {
                         self.out.push_str(&format!("\t.zero {}\n", total_size - offset));
                     }
+                }
                 }
             }
             CType::Array(elem, count) => {

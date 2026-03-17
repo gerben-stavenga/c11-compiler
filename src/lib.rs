@@ -56,17 +56,20 @@ pub fn parse(input: &str) -> Result<ast::TranslationUnit, String> {
                 }
                 "__extension__" => continue,
                 _ => {
-                    parser.push(T::Name(name.clone()), &mut actions).map_err(|e| parser.format_error(&e))?;
+                    parser.push(T::Name(name.clone()), &mut actions).map_err(|e| format!("{:?}", e))?;
                     let kind = if actions.ctx.is_typedef(&name) { T::Type } else { T::Variable };
-                    parser.push(kind, &mut actions).map_err(|e| parser.format_error(&e))?;
+                    parser.push(kind, &mut actions).map_err(|e| format!("{:?}", e))?;
                 }
             }
         } else {
-            parser.push(tok, &mut actions).map_err(|e| parser.format_error(&e))?;
+            parser.push(tok, &mut actions).map_err(|e| format!("{:?}", e))?;
         }
     }
 
-    let defs = parser.finish(&mut actions).map_err(|(p, e)| p.format_error(&e))?;
+    let defs = parser.finish(&mut actions).map_err(|(p, e)| match e {
+        gazelle::ParseError::Syntax { terminal } => p.format_error(terminal, None, None),
+        gazelle::ParseError::Action(e) => format!("{:?}", e),
+    })?;
     let mut unit = ast::TranslationUnit { decls: vec![], functions: vec![], structs: Default::default() };
     for def in defs {
         match def {

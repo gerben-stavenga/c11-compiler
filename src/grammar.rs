@@ -6,7 +6,7 @@ use gazelle_macros::gazelle;
 use crate::ast::*;
 
 gazelle! {
-    pub(crate) grammar C11 = "../grammars/c11.gzl"
+    pub(crate) grammar C11 = "grammars/c11.gzl"
 }
 
 // === Typedef context types ===
@@ -119,8 +119,11 @@ type R<T> = Result<T, gazelle::ParseError>;
 
 // === Types impl ===
 
-impl C11::Types for CActions {
+impl gazelle::ErrorType for CActions {
     type Error = gazelle::ParseError;
+}
+
+impl C11::Types for CActions {
     // Terminal payloads
     type Name = String;
     type Constant = String;
@@ -162,12 +165,14 @@ impl C11::Types for CActions {
     // Expressions — all collapse to ExprNode
     type PrimaryExpression = ExprNode;
     type GenericSelection = ExprNode;
+    type VaArgExpression = ExprNode;
     type GenericAssociation = GenericAssoc;
     type ArgumentExpressionList = Vec<ExprNode>;
     type PostfixExpression = ExprNode;
     type UnaryExpression = ExprNode;
     type UnaryOperator = UnaryOp;
     type CastExpression = ExprNode;
+    type BinaryOp = Op;
     type AssignmentExpression = ExprNode;
     type Expression = ExprNode;
     type ConstantExpression = ExprNode;
@@ -846,8 +851,15 @@ impl gazelle::Action<C11::PrimaryExpression<Self>> for CActions {
             }
             C11::PrimaryExpression::Paren(e) => e,
             C11::PrimaryExpression::Generic(e) => e,
-            C11::PrimaryExpression::VaArg(e, ty) => expr(Expr::VaArg(e, ty)),
+            C11::PrimaryExpression::VaArg(e) => e,
         })
+    }
+}
+
+impl gazelle::Action<C11::VaArgExpression<Self>> for CActions {
+    fn build(&mut self, node: C11::VaArgExpression<Self>) -> R<ExprNode> {
+        let C11::VaArgExpression::VaArg(e, ty) = node;
+        Ok(expr(Expr::VaArg(e, ty)))
     }
 }
 
@@ -930,16 +942,24 @@ impl gazelle::Action<C11::CastExpression<Self>> for CActions {
     }
 }
 
+impl gazelle::Action<C11::BinaryOp<Self>> for CActions {
+    fn build(&mut self, node: C11::BinaryOp<Self>) -> R<Op> {
+        Ok(match node {
+            C11::BinaryOp::Binop(op) => op,
+            C11::BinaryOp::Mul => Op::Mul,
+            C11::BinaryOp::Bitand => Op::BitAnd,
+            C11::BinaryOp::Add => Op::Add,
+            C11::BinaryOp::Sub => Op::Sub,
+            C11::BinaryOp::Assign => Op::Assign,
+        })
+    }
+}
+
 impl gazelle::Action<C11::AssignmentExpression<Self>> for CActions {
     fn build(&mut self, node: C11::AssignmentExpression<Self>) -> R<ExprNode> {
         Ok(match node {
             C11::AssignmentExpression::Cast(e) => e,
             C11::AssignmentExpression::Binop(l, op, r) => expr(Expr::BinOp(op, l, r)),
-            C11::AssignmentExpression::Mul(l, r) => expr(Expr::BinOp(Op::Mul, l, r)),
-            C11::AssignmentExpression::Bitand(l, r) => expr(Expr::BinOp(Op::BitAnd, l, r)),
-            C11::AssignmentExpression::Add(l, r) => expr(Expr::BinOp(Op::Add, l, r)),
-            C11::AssignmentExpression::Sub(l, r) => expr(Expr::BinOp(Op::Sub, l, r)),
-            C11::AssignmentExpression::Assign(l, r) => expr(Expr::BinOp(Op::Assign, l, r)),
             C11::AssignmentExpression::Ternary(cond, then, else_) => expr(Expr::Ternary(cond, then, else_)),
         })
     }
