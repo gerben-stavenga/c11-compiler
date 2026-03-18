@@ -614,8 +614,14 @@ impl TypeChecker {
                 (Expr::Comma(l, r), ty)
             }
             Expr::CompoundLiteral(cl_ty, items) => {
-                let ty = self.resolve_typedef(cl_ty.clone());
-                (Expr::CompoundLiteral(cl_ty, items), ty)
+                let mut ty = self.resolve_typedef(cl_ty.clone());
+                let items = self.check_init_list(items)?;
+                // Infer unsized array from initializer count
+                if let CType::Array(ref elem, None) = ty {
+                    let fpe = self.scalar_init_slots(elem);
+                    ty = CType::Array(elem.clone(), Some(infer_init_list_size(&items, fpe)));
+                }
+                (Expr::CompoundLiteral(ty.clone(), items), ty)
             }
             Expr::VaArg(inner, va_ty) => {
                 let inner = self.rvalue(inner)?;

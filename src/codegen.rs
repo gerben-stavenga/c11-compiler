@@ -27,6 +27,8 @@ struct Codegen {
     static_defs: Vec<(String, CType, Option<Init>)>,
     /// For variadic functions: stack offset of register save area, and number of named int params
     va_info: Option<(i32, usize)>,
+    /// Compound literal stack offsets, keyed by AST node pointer identity
+    cl_offsets: HashMap<*const Expr, i32>,
 }
 
 impl Codegen {
@@ -45,6 +47,7 @@ impl Codegen {
             statics: HashMap::new(),
             static_defs: Vec::new(),
             va_info: None,
+            cl_offsets: HashMap::new(),
         }
     }
 
@@ -229,6 +232,121 @@ impl Codegen {
                 self.alloc_locals(s);
             }
             _ => {}
+        }
+    }
+
+    /// Scan statements/expressions for compound literals and allocate stack slots.
+    fn alloc_compound_literals_stmt(&mut self, stmt: &Stmt) {
+        match stmt {
+            Stmt::Compound(items) => {
+                for item in items {
+                    match item {
+                        BlockItem::Decl(d) => {
+                            for id in &d.declarators {
+                                if let Some(init) = &id.init {
+                                    self.alloc_compound_literals_init(init);
+                                }
+                            }
+                        }
+                        BlockItem::Stmt(s) => self.alloc_compound_literals_stmt(s),
+                    }
+                }
+            }
+            Stmt::Expr(Some(e)) => self.alloc_compound_literals_expr(e),
+            Stmt::Return(Some(e)) => self.alloc_compound_literals_expr(e),
+            Stmt::If(cond, then, else_) => {
+                self.alloc_compound_literals_expr(cond);
+                self.alloc_compound_literals_stmt(then);
+                if let Some(e) = else_ { self.alloc_compound_literals_stmt(e); }
+            }
+            Stmt::While(cond, body) => {
+                self.alloc_compound_literals_expr(cond);
+                self.alloc_compound_literals_stmt(body);
+            }
+            Stmt::DoWhile(body, cond) => {
+                self.alloc_compound_literals_stmt(body);
+                self.alloc_compound_literals_expr(cond);
+            }
+            Stmt::For(init, cond, inc, body) => {
+                if let ForInit::Decl(d) = init {
+                    for id in &d.declarators {
+                        if let Some(init) = &id.init {
+                            self.alloc_compound_literals_init(init);
+                        }
+                    }
+                } else if let ForInit::Expr(Some(e)) = init {
+                    self.alloc_compound_literals_expr(e);
+                }
+                if let Some(e) = cond { self.alloc_compound_literals_expr(e); }
+                if let Some(e) = inc { self.alloc_compound_literals_expr(e); }
+                self.alloc_compound_literals_stmt(body);
+            }
+            Stmt::Switch(e, body) => {
+                self.alloc_compound_literals_expr(e);
+                self.alloc_compound_literals_stmt(body);
+            }
+            Stmt::Labeled(_, s) | Stmt::Case(_, s) | Stmt::Default(s) => {
+                self.alloc_compound_literals_stmt(s);
+            }
+            _ => {}
+        }
+    }
+
+    fn alloc_compound_literals_expr(&mut self, e: &ExprNode) {
+        match e.expr.as_ref() {
+            Expr::CompoundLiteral(cl_ty, items) => {
+                let size = self.type_size(cl_ty).max(8);
+                self.stack_size += size;
+                let offset = -self.stack_size;
+                self.cl_offsets.insert(e.expr.as_ref() as *const Expr, offset);
+                // Also scan initializer expressions for nested compound literals
+                for item in items {
+                    self.alloc_compound_literals_init(&item.init);
+                }
+            }
+            Expr::BinOp(_, l, r) | Expr::Comma(l, r) => {
+                self.alloc_compound_literals_expr(l);
+                self.alloc_compound_literals_expr(r);
+            }
+            Expr::UnaryOp(_, inner) | Expr::Load(inner) | Expr::Decay(inner)
+            | Expr::FuncToPtr(inner) | Expr::Widen(inner) | Expr::Cast(_, inner)
+            | Expr::ImplicitCast(_, inner) | Expr::SizeofExpr(inner)
+            | Expr::Member(inner, _) | Expr::PtrMember(inner, _) | Expr::VaArg(inner, _) => {
+                self.alloc_compound_literals_expr(inner);
+            }
+            Expr::Index(a, b) => {
+                self.alloc_compound_literals_expr(a);
+                self.alloc_compound_literals_expr(b);
+            }
+            Expr::Ternary(a, b, c) => {
+                self.alloc_compound_literals_expr(a);
+                self.alloc_compound_literals_expr(b);
+                self.alloc_compound_literals_expr(c);
+            }
+            Expr::Call(func, args) => {
+                self.alloc_compound_literals_expr(func);
+                for arg in args {
+                    self.alloc_compound_literals_expr(arg);
+                }
+            }
+            Expr::Generic(ctrl, assocs) => {
+                self.alloc_compound_literals_expr(ctrl);
+                for assoc in assocs {
+                    self.alloc_compound_literals_expr(&assoc.expr);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn alloc_compound_literals_init(&mut self, init: &Init) {
+        match init {
+            Init::Expr(e) => self.alloc_compound_literals_expr(e),
+            Init::List(items) => {
+                for item in items {
+                    self.alloc_compound_literals_init(&item.init);
+                }
+            }
         }
     }
 
@@ -488,6 +606,11 @@ impl Codegen {
                 self.label(&lend);
                 // Clean up saved va_list ptr
                 self.pop_int("%rcx");
+            }
+            Expr::CompoundLiteral(cl_ty, items) => {
+                let offset = *self.cl_offsets.get(&(e.expr.as_ref() as *const Expr)).unwrap();
+                self.emit_local_init_list(offset, cl_ty, items);
+                self.emit(&format!("leaq {}(%rbp), %rax", offset));
             }
             _ => {
                 // Fallback for unhandled expr variants
@@ -1679,7 +1802,13 @@ impl Codegen {
                 match init {
                     Init::Expr(e) => {
                         self.emit_expr(e);
-                        if Self::is_float(ty) {
+                        if matches!(ty, CType::Struct(_) | CType::Union(_)) {
+                            let size = self.type_size(ty);
+                            self.emit("movq %rax, %rsi");
+                            self.emit(&format!("leaq {}(%rbp), %rdi", offset));
+                            self.emit(&format!("movl ${}, %ecx", size));
+                            self.emit("rep movsb");
+                        } else if Self::is_float(ty) {
                             self.emit(&format!("leaq {}(%rbp), %rax", offset));
                             self.emit_store(ty);
                         } else {
@@ -1857,6 +1986,7 @@ impl Codegen {
 
         // Allocate local variable slots
         self.alloc_locals(&f.body);
+        self.alloc_compound_literals_stmt(&f.body);
 
         // Align stack: push %rbx adds 8, so need (stack_size + 8) ≡ 0 (mod 16)
         self.stack_size = ((self.stack_size + 8 + 15) & !15) - 8;
@@ -1953,9 +2083,9 @@ impl Codegen {
 
     fn emit_data_value(&mut self, size: i32, val: i64) {
         match size {
-            1 => self.out.push_str(&format!("\t.byte {}\n", val)),
-            2 => self.out.push_str(&format!("\t.short {}\n", val)),
-            4 => self.out.push_str(&format!("\t.long {}\n", val)),
+            1 => self.out.push_str(&format!("\t.byte {}\n", val as u8)),
+            2 => self.out.push_str(&format!("\t.short {}\n", val as i16)),
+            4 => self.out.push_str(&format!("\t.long {}\n", val as i32)),
             8 => self.out.push_str(&format!("\t.quad {}\n", val)),
             _ => self.out.push_str(&format!("\t.zero {}\n", size)),
         }
@@ -2077,17 +2207,50 @@ impl Codegen {
                     }
 
                     let mut offset = 0;
-                    for (i, (_, field_offset, field_ty, _)) in fields.iter().enumerate() {
-                        if *field_offset > offset {
+                    let mut i = 0;
+                    while i < fields.len() {
+                        let (_, field_offset, ref field_ty, ref bf_info) = fields[i];
+                        if field_offset > offset {
                             self.out.push_str(&format!("\t.zero {}\n", field_offset - offset));
                         }
                         let field_size = self.type_size(field_ty);
-                        if let Some(init) = field_inits[i] {
-                            self.emit_init_item(init, field_ty, field_size);
+
+                        if let Some((bit_off, bit_width)) = bf_info {
+                            // Bitfield: accumulate all bitfields in this storage unit
+                            let storage_offset = field_offset;
+                            let mut packed: u64 = 0;
+                            if let Some(init) = field_inits[i] {
+                                let val = self.eval_const_init(init).unwrap_or(0);
+                                let mask = (1u64 << bit_width) - 1;
+                                packed |= (val as u64 & mask) << bit_off;
+                            }
+                            i += 1;
+                            // Consume remaining bitfields in the same storage unit
+                            while i < fields.len() {
+                                let (_, fo, _, ref bfi) = fields[i];
+                                if fo != storage_offset { break; }
+                                if let Some((bo, bw)) = bfi {
+                                    if let Some(init) = field_inits[i] {
+                                        let val = self.eval_const_init(init).unwrap_or(0);
+                                        let mask = (1u64 << bw) - 1;
+                                        packed |= (val as u64 & mask) << bo;
+                                    }
+                                    i += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            self.emit_data_value(field_size, packed as i64);
+                            offset = storage_offset + field_size;
                         } else {
-                            self.out.push_str(&format!("\t.zero {}\n", field_size));
+                            if let Some(init) = field_inits[i] {
+                                self.emit_init_item(init, field_ty, field_size);
+                            } else {
+                                self.out.push_str(&format!("\t.zero {}\n", field_size));
+                            }
+                            offset = field_offset + field_size;
+                            i += 1;
                         }
-                        offset = field_offset + field_size;
                     }
                     if offset < total_size {
                         self.out.push_str(&format!("\t.zero {}\n", total_size - offset));
@@ -2412,6 +2575,13 @@ fn eval_const_init_inner(&self, e: &ExprNode) -> Option<i64> {
     Self::eval_const_init_static(e, &self.struct_layouts)
 }
 
+fn eval_const_init(&self, init: &Init) -> Option<i64> {
+    match init {
+        Init::Expr(e) => self.eval_const_init_inner(e),
+        _ => None,
+    }
+}
+
 fn eval_const_init_static(e: &ExprNode, struct_layouts: &HashMap<String, StructLayout>) -> Option<i64> {
     let rec = |e: &ExprNode| Self::eval_const_init_static(e, struct_layouts);
     let ty = e.ty.as_ref();
@@ -2468,6 +2638,7 @@ fn eval_const_init_static(e: &ExprNode, struct_layouts: &HashMap<String, StructL
         Expr::SizeofType(t) => {
             Some(type_size_static(t, struct_layouts) as i64)
         }
+        Expr::Widen(inner) | Expr::Decay(inner) | Expr::FuncToPtr(inner) => rec(inner),
         Expr::UnaryOp(UnaryOp::Plus, inner) => rec(inner),
         Expr::UnaryOp(UnaryOp::Neg, inner) => {
             let v = rec(inner)?;
